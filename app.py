@@ -1,6 +1,7 @@
 import os
 import time
 import sqlite3
+import psycopg2
 from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -30,8 +31,7 @@ model = load_model(MODEL_PATH)
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
+        db = g._database = psycopg2.connect(os.environ.get("DATABASE_URL"))
     return db
 
 @app.teardown_appcontext
