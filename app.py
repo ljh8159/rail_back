@@ -1,7 +1,6 @@
 import os
-import time
-import sqlite3
 import psycopg2
+import psycopg2.extras
 from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -15,10 +14,9 @@ from datetime import datetime, timedelta
 
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
-DATABASE = 'reports.db'
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # CORS 설정
+CORS(app, resources={r"/*": {"origins": "*"}})
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 if not os.path.exists(UPLOAD_FOLDER):
@@ -43,9 +41,10 @@ def close_connection(exception):
 def init_db():
     with app.app_context():
         db = get_db()
-        db.execute('''
+        cur = db.cursor()
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 user_id TEXT,
                 type TEXT,
                 photo_filename TEXT,
@@ -60,31 +59,22 @@ def init_db():
                 for_userpage_stage INTEGER
             )
         ''')
-        try:
-            db.execute("ALTER TABLE reports ADD COLUMN dispatch_user_id TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            db.execute("ALTER TABLE reports ADD COLUMN for_userpage_type TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            db.execute("ALTER TABLE reports ADD COLUMN for_userpage_stage INTEGER")
-        except sqlite3.OperationalError:
-            pass
         db.commit()
+        cur.close()
 
 def init_user_table():
     with app.app_context():
         db = get_db()
-        db.execute('''
+        cur = db.cursor()
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 user_id TEXT UNIQUE,
                 password TEXT
             )
         ''')
         db.commit()
+        cur.close()
 
 init_db()
 init_user_table()
@@ -109,7 +99,6 @@ def upload_photo():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     if file and allowed_file(file.filename):
-        # 원본 파일명 그대로 사용 (보안상 안전하게)
         filename = secure_filename(file.filename)
         file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
         return jsonify({'filename': filename})
@@ -152,19 +141,20 @@ def save_report():
     for_userpage_type = data.get('for_userpage_type', type_)
     for_userpage_stage = data.get('for_userpage_stage', ai_stage)
 
-    # timestamp가 없거나 빈 값이면 한국시간(KST)으로 생성
     if not timestamp:
         kst = datetime.utcnow() + timedelta(hours=9)
         timestamp = kst.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+09:00'
 
     db = get_db()
-    db.execute(
+    cur = db.cursor()
+    cur.execute(
         '''INSERT INTO reports 
         (user_id, type, photo_filename, location, lat, lng, timestamp, ai_stage, extra, dispatch_user_id, for_userpage_type, for_userpage_stage)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
         (user_id, type_, photo_filename, location, lat, lng, timestamp, ai_stage, extra, dispatch_user_id, for_userpage_type, for_userpage_stage)
     )
     db.commit()
+    cur.close()
     return jsonify({'result': 'success'})
 
 @app.route('/api/report_update', methods=['POST'])
@@ -173,20 +163,24 @@ def update_report():
     location = data.get('location')
     dispatch_user_id = data.get('dispatch_user_id', None)
     db = get_db()
-    db.execute(
-        "UPDATE reports SET type='출동', ai_stage=1, dispatch_user_id=? WHERE location=? AND type='신고'",
+    cur = db.cursor()
+    cur.execute(
+        "UPDATE reports SET type='출동', ai_stage=1, dispatch_user_id=%s WHERE location=%s AND type='신고'",
         (dispatch_user_id, location)
     )
     db.commit()
+    cur.close()
     return jsonify({'result': 'updated'})
 
 @app.route('/api/report_stats', methods=['GET'])
 def report_stats():
     db = get_db()
-    cur1 = db.execute("SELECT COUNT(*) FROM reports WHERE type='신고' AND ai_stage=3")
-    blocked_count = cur1.fetchone()[0]
-    cur2 = db.execute("SELECT COUNT(*) FROM reports WHERE type='출동' AND ai_stage=1")
-    dispatched_count = cur2.fetchone()[0]
+    cur = db.cursor()
+    cur.execute("SELECT COUNT(*) FROM reports WHERE type='신고' AND ai_stage=3")
+    blocked_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM reports WHERE type='출동' AND ai_stage=1")
+    dispatched_count = cur.fetchone()[0]
+    cur.close()
     return jsonify({
         "blocked_count": blocked_count,
         "dispatched_count": dispatched_count
@@ -196,11 +190,12 @@ def report_stats():
 def all_reports():
     limit = request.args.get('limit', default=3, type=int)
     db = get_db()
-    cur = db.execute(
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT type, location, timestamp FROM reports WHERE type='신고' AND ai_stage=3 "
         "UNION ALL "
         "SELECT type, location, timestamp FROM reports WHERE type='출동' AND ai_stage=1 "
-        "ORDER BY timestamp DESC LIMIT ?",
+        "ORDER BY timestamp DESC LIMIT %s",
         (limit,)
     )
     reports = []
@@ -233,6 +228,7 @@ def all_reports():
             "timestamp": row["timestamp"],
             "time": time_str
         })
+    cur.close()
     return jsonify(reports)
 
 @app.route('/api/user_reports', methods=['GET'])
@@ -240,11 +236,12 @@ def user_reports():
     user_id = request.args.get('user_id', 'guest')
     limit = request.args.get('limit', default=3, type=int)
     db = get_db()
-    cur = db.execute(
-        "SELECT type, location, timestamp FROM reports WHERE user_id=? AND for_userpage_type='신고' AND for_userpage_stage=3 "
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT type, location, timestamp FROM reports WHERE user_id=%s AND for_userpage_type='신고' AND for_userpage_stage=3 "
         "UNION ALL "
-        "SELECT type, location, timestamp FROM reports WHERE dispatch_user_id=? AND type='출동' AND ai_stage=1 "
-        "ORDER BY timestamp DESC LIMIT ?",
+        "SELECT type, location, timestamp FROM reports WHERE dispatch_user_id=%s AND type='출동' AND ai_stage=1 "
+        "ORDER BY timestamp DESC LIMIT %s",
         (user_id, user_id, limit)
     )
     reports = []
@@ -277,24 +274,25 @@ def user_reports():
             "timestamp": row["timestamp"],
             "time": time_str
         })
+    cur.close()
     return jsonify(reports)
 
 @app.route('/api/user_stats', methods=['GET'])
 def user_stats():
     user_id = request.args.get('user_id', 'guest')
     db = get_db()
-    # 신고건수
-    cur1 = db.execute(
-        "SELECT COUNT(*) FROM reports WHERE user_id=? AND for_userpage_type='신고' AND for_userpage_stage=3",
+    cur = db.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM reports WHERE user_id=%s AND for_userpage_type='신고' AND for_userpage_stage=3",
         (user_id,)
     )
-    report_count = cur1.fetchone()[0]
-    # 출동건수
-    cur2 = db.execute(
-        "SELECT COUNT(*) FROM reports WHERE dispatch_user_id=? AND type='출동' AND ai_stage=1",
+    report_count = cur.fetchone()[0]
+    cur.execute(
+        "SELECT COUNT(*) FROM reports WHERE dispatch_user_id=%s AND type='출동' AND ai_stage=1",
         (user_id,)
     )
-    dispatch_count = cur2.fetchone()[0]
+    dispatch_count = cur.fetchone()[0]
+    cur.close()
     return jsonify({
         "report_count": report_count,
         "dispatch_count": dispatch_count
@@ -304,14 +302,15 @@ def user_stats():
 def user_point():
     user_id = request.args.get('user_id', 'guest')
     db = get_db()
-    cur1 = db.execute("SELECT COUNT(*) FROM reports WHERE user_id=? AND for_userpage_type='신고' AND for_userpage_stage=3", (user_id,))
-    report_count = cur1.fetchone()[0]
-    cur2 = db.execute("SELECT COUNT(*) FROM reports WHERE dispatch_user_id=? AND type='출동' AND ai_stage=1", (user_id,))
-    dispatch_count = cur2.fetchone()[0]
+    cur = db.cursor()
+    cur.execute("SELECT COUNT(*) FROM reports WHERE user_id=%s AND for_userpage_type='신고' AND for_userpage_stage=3", (user_id,))
+    report_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM reports WHERE dispatch_user_id=%s AND type='출동' AND ai_stage=1", (user_id,))
+    dispatch_count = cur.fetchone()[0]
+    cur.close()
     point = report_count * 5000 + dispatch_count * 10000
     return jsonify({"point": point})
 
-# --- 회원가입 API (테스트용) ---
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -321,14 +320,17 @@ def register():
         return jsonify({'error': '아이디/비밀번호 필요'}), 400
     db = get_db()
     hashed_pw = hashlib.sha256(password.encode()).hexdigest()
+    cur = db.cursor()
     try:
-        db.execute('INSERT INTO users (user_id, password) VALUES (?, ?)', (user_id, hashed_pw))
+        cur.execute('INSERT INTO users (user_id, password) VALUES (%s, %s)', (user_id, hashed_pw))
         db.commit()
+        cur.close()
         return jsonify({'result': 'success'})
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        db.rollback()
+        cur.close()
         return jsonify({'error': '이미 존재하는 아이디'}), 400
 
-# --- 로그인 API ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -337,8 +339,10 @@ def login():
     if not user_id or not password:
         return jsonify({'error': '아이디/비밀번호 필요'}), 400
     db = get_db()
-    cur = db.execute('SELECT * FROM users WHERE user_id=?', (user_id,))
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('SELECT * FROM users WHERE user_id=%s', (user_id,))
     user = cur.fetchone()
+    cur.close()
     if not user:
         return jsonify({'error': '존재하지 않는 아이디'}), 400
     hashed_pw = hashlib.sha256(password.encode()).hexdigest()
@@ -350,7 +354,8 @@ def login():
 @app.route('/api/reports', methods=['GET'])
 def api_reports():
     db = get_db()
-    cur = db.execute(
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT lat, lng, location, timestamp FROM reports WHERE type='신고' AND ai_stage=3"
     )
     reports = []
@@ -361,6 +366,7 @@ def api_reports():
             "location": row["location"],
             "timestamp": row["timestamp"]
         })
+    cur.close()
     return jsonify(reports)
 
 @app.route('/uploads/<filename>')
@@ -370,7 +376,8 @@ def uploaded_file(filename):
 @app.route('/api/admin_reports', methods=['GET'])
 def admin_reports():
     db = get_db()
-    cur = db.execute(
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT id, type, location, timestamp FROM reports WHERE type='신고' AND ai_stage=2 ORDER BY timestamp DESC"
     )
     reports = []
@@ -404,6 +411,7 @@ def admin_reports():
             "timestamp": row["timestamp"],
             "time": time_str
         })
+    cur.close()
     return jsonify(reports)
 
 @app.route('/api/admin_approve', methods=['POST'])
@@ -414,12 +422,13 @@ def admin_approve():
     if not report_id or stage not in [3, 5]:
         return jsonify({'result': 'fail', 'error': 'invalid params'}), 400
     db = get_db()
-    # ai_stage와 for_userpage_stage를 모두 업데이트
-    db.execute(
-        "UPDATE reports SET ai_stage=?, for_userpage_stage=? WHERE id=?",
+    cur = db.cursor()
+    cur.execute(
+        "UPDATE reports SET ai_stage=%s, for_userpage_stage=%s WHERE id=%s",
         (stage, stage, report_id)
     )
     db.commit()
+    cur.close()
     return jsonify({'result': 'success'})
 
 if __name__ == '__main__':
